@@ -1,5 +1,7 @@
 # tarstream
 
+WIP with breaking changes.
+
 rust library for streaming large tar files during download and extracting them on-the-fly with zero-copy processing.
 
 ## features
