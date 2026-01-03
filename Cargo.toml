@@ -1,5 +1,4 @@
 [package]
-[package]
 name = "tarstream"
 description = "tarstream download and extract on the fly"
 license-file = "LICENSE"
