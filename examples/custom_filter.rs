@@ -10,12 +10,13 @@ struct SelectiveExtractor {
     matched_files: Vec<String>,
     current_file: Option<File>,
     skip_current: bool,
+    stop_on_first: bool,
     bytes_saved: u64,
     bytes_skipped: u64,
 }
 
 impl SelectiveExtractor {
-    fn new(pattern: &str, output_dir: Option<String>) -> Result<Self> {
+    fn new(pattern: &str, output_dir: Option<String>, stop_on_first: bool) -> Result<Self> {
         let regex_pattern = glob_to_regex(pattern);
         let pattern = Regex::new(&regex_pattern)
             .map_err(|e| Error::CallbackError(format!("Invalid pattern: {}", e)))?;
@@ -30,6 +31,7 @@ impl SelectiveExtractor {
             matched_files: Vec::new(),
             current_file: None,
             skip_current: false,
+            stop_on_first,
             bytes_saved: 0,
             bytes_skipped: 0,
         })
@@ -88,6 +90,12 @@ impl FileCallback for SelectiveExtractor {
 
     fn on_file_end(&mut self, _metadata: &FileMetadata) -> Result<CallbackAction> {
         self.current_file = None;
+
+        if self.stop_on_first && !self.skip_current && !self.matched_files.is_empty() {
+            println!("\n[stopping after first match]");
+            return Ok(CallbackAction::Stop);
+        }
+
         Ok(CallbackAction::Continue)
     }
 }
@@ -140,17 +148,21 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
     if args.len() < 3 {
-        eprintln!("Usage: {} <url> <pattern> [output_dir]", args[0]);
+        eprintln!("Usage: {} <url> <pattern> [output_dir] [--stop-on-first]", args[0]);
         eprintln!();
         eprintln!("Examples:");
         eprintln!("  {} https://example.com/archive.tar.gz '*.jpg' ./images", args[0]);
         eprintln!("  {} https://example.com/logs.tar.gz '*.json' ./filtered", args[0]);
         eprintln!("  {} https://example.com/data.tar.gz 'reports/**/*.csv' ./output", args[0]);
+        eprintln!("  {} https://example.com/huge.tar.gz 'needle.txt' . --stop-on-first", args[0]);
         eprintln!();
         eprintln!("Pattern syntax:");
         eprintln!("  *     - matches any characters except /");
         eprintln!("  **    - matches any characters including /");
         eprintln!("  ?     - matches a single character");
+        eprintln!();
+        eprintln!("Options:");
+        eprintln!("  --stop-on-first   stop extraction after finding first match");
         eprintln!();
         eprintln!("How it works:");
         eprintln!("  - Downloads and streams the tar file");
@@ -162,11 +174,17 @@ async fn main() -> Result<()> {
 
     let url = &args[1];
     let pattern = &args[2];
-    let output_dir = if args.len() >= 4 {
-        Some(args[3].clone())
-    } else {
-        None
-    };
+
+    let mut output_dir = None;
+    let mut stop_on_first = false;
+
+    for i in 3..args.len() {
+        if args[i] == "--stop-on-first" {
+            stop_on_first = true;
+        } else if output_dir.is_none() {
+            output_dir = Some(args[i].clone());
+        }
+    }
 
     println!("Downloading: {}", url);
     println!("Filtering for files matching: {}", pattern);
@@ -175,13 +193,16 @@ async fn main() -> Result<()> {
     } else {
         println!("Output directory: (none - analysis only)");
     }
+    if stop_on_first {
+        println!("Mode: stop after first match");
+    }
     println!();
 
     let extractor = TarStreamExtractor::new()
         .with_compression(CompressionType::Auto)
         .with_buffer_size(64 * 1024);
 
-    let mut callback = SelectiveExtractor::new(pattern, output_dir)?;
+    let mut callback = SelectiveExtractor::new(pattern, output_dir, stop_on_first)?;
 
     let stats = extractor.extract_from_url(url, &mut callback).await?;
 
