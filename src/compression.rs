@@ -1,4 +1,3 @@
-use crate::error::Result;
 use crate::CompressionType;
 use bzip2::read::BzDecoder;
 use flate2::read::GzDecoder;
@@ -64,24 +63,5 @@ impl<R: AsyncRead + Unpin> Read for Decompressor<R> {
             Decompressor::Bzip2(decoder) => decoder.read(buf),
             Decompressor::Xz(decoder) => decoder.read(buf),
         }
-    }
-}
-
-pub(crate) async fn detect_compression<R>(reader: &mut R) -> Result<CompressionType>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut magic = [0u8; 6];
-    let n = reader.read(&mut magic).await?;
-
-    if n < 2 {
-        return Ok(CompressionType::None);
-    }
-
-    match &magic[..2] {
-        [0x1f, 0x8b] => Ok(CompressionType::Gzip),
-        [0x42, 0x5a] => Ok(CompressionType::Bzip2),
-        _ if n >= 6 && &magic[..6] == b"\xfd7zXZ\x00" => Ok(CompressionType::Xz),
-        _ => Ok(CompressionType::None),
     }
 }
