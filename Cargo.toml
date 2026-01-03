@@ -1,7 +1,13 @@
 [package]
+[package]
 name = "tarstream"
+description = "tarstream download and extract on the fly"
+license-file = "LICENSE"
 version = "0.1.0"
 edition = "2024"
+
+repository = "https://github.com/ax-x2/tarstream"
+homepage = "https://1000x.sh"
 
 [dependencies]
 tokio = { version = "1.49", features = ["rt-multi-thread", "net", "io-util", "macros"] }
