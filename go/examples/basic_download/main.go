@@ -7,11 +7,89 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	tarstream "github.com/ax-x2/tarstream/go"
 )
+
+// DecompressedStreamBuffer stores decompressed tar stream in memory.
+// runs asynchronously in dedicated goroutine - does NOT block pipeline.
+//
+// example use case: keep decompressed tar in memory for later re-processing,
+// verification, or saving to disk without re-downloading.
+type DecompressedStreamBuffer struct {
+	chunks      [][]byte      // decompressed chunks stored in memory
+	totalBytes  atomic.Uint64 // total bytes stored
+	mu          sync.Mutex    // protects chunks slice
+	maxSize     uint64        // optional size limit (0 = unlimited)
+	enabled     bool          // enable/disable buffering
+}
+
+// NewDecompressedStreamBuffer creates a new in-memory buffer for decompressed stream.
+// maxSize: maximum bytes to buffer (0 = unlimited, be careful with large archives!)
+func NewDecompressedStreamBuffer(maxSize uint64, enabled bool) *DecompressedStreamBuffer {
+	return &DecompressedStreamBuffer{
+		chunks:  make([][]byte, 0, 1024), // pre-allocate for 1024 chunks
+		maxSize: maxSize,
+		enabled: enabled,
+	}
+}
+
+// OnDecompressedChunk stores each decompressed chunk in memory (async, non-blocking)
+func (b *DecompressedStreamBuffer) OnDecompressedChunk(chunk []byte) error {
+	if !b.enabled {
+		return nil // buffering disabled
+	}
+
+	// check size limit
+	if b.maxSize > 0 && b.totalBytes.Load() >= b.maxSize {
+		return nil // size limit reached, stop buffering
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	// chunk is already a copy (safe to retain)
+	b.chunks = append(b.chunks, chunk)
+	b.totalBytes.Add(uint64(len(chunk)))
+
+	return nil
+}
+
+// GetTotalBytes returns total bytes buffered
+func (b *DecompressedStreamBuffer) GetTotalBytes() uint64 {
+	return b.totalBytes.Load()
+}
+
+// GetChunkCount returns number of chunks buffered
+func (b *DecompressedStreamBuffer) GetChunkCount() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.chunks)
+}
+
+// SaveToFile writes buffered decompressed tar to disk
+func (b *DecompressedStreamBuffer) SaveToFile(path string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	writer := bufio.NewWriterSize(f, 1024*1024) // 1MB buffer
+	for _, chunk := range b.chunks {
+		if _, err := writer.Write(chunk); err != nil {
+			return err
+		}
+	}
+
+	return writer.Flush()
+}
 
 // FileExtractor extracts tar contents to a directory
 type FileExtractor struct {
@@ -108,14 +186,30 @@ func (f *FileExtractor) OnError(err error) tarstream.CallbackAction {
 
 func main() {
 	if len(os.Args) < 3 {
-		fmt.Fprintf(os.Stderr, "Usage: %s <url> <output_dir>\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s <url> <output_dir> [--buffer-decompressed] [--max-buffer-mb <size>]\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "\nExample:\n")
 		fmt.Fprintf(os.Stderr, "  %s https://example.com/archive.tar.gz ./output\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  %s https://example.com/archive.tar.gz ./output --buffer-decompressed --max-buffer-mb 100\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "\nOptions:\n")
+		fmt.Fprintf(os.Stderr, "  --buffer-decompressed      Store decompressed tar in memory (for re-processing)\n")
+		fmt.Fprintf(os.Stderr, "  --max-buffer-mb <size>     Max MB to buffer (0 = unlimited, default: 0)\n")
 		os.Exit(1)
 	}
 
 	url := os.Args[1]
 	outputDir := os.Args[2]
+
+	// parse optional flags
+	bufferEnabled := false
+	maxBufferMB := uint64(0)
+	for i := 3; i < len(os.Args); i++ {
+		if os.Args[i] == "--buffer-decompressed" {
+			bufferEnabled = true
+		} else if os.Args[i] == "--max-buffer-mb" && i+1 < len(os.Args) {
+			fmt.Sscanf(os.Args[i+1], "%d", &maxBufferMB)
+			i++
+		}
+	}
 
 	// create HTTP client with optimized settings for large downloads
 	httpClient := &http.Client{
@@ -132,11 +226,24 @@ func main() {
 		},
 	}
 
+	// create optional in-memory buffer for decompressed stream
+	var streamBuffer *DecompressedStreamBuffer
+	if bufferEnabled {
+		maxBufferBytes := maxBufferMB * 1024 * 1024
+		streamBuffer = NewDecompressedStreamBuffer(maxBufferBytes, true)
+		fmt.Printf("Decompressed stream buffering: ENABLED (max: %d MB)\n", maxBufferMB)
+	}
+
 	// create extractor with optimized settings for large files
 	extractor := tarstream.New().
 		WithCompression(tarstream.Auto).        // auto-detect (uses adaptive buffer sizing)
 		WithChannelCapacity(64).                // large capacity for 100GB files (64 * 256KB = 16MB pipeline depth)
 		WithHTTPClient(httpClient)              // use optimized HTTP client
+
+	// add stream callback if buffering enabled
+	if streamBuffer != nil {
+		extractor = extractor.WithStreamCallback(streamBuffer)
+	}
 
 	callback := &FileExtractor{
 		outputDir:       outputDir,
@@ -145,7 +252,11 @@ func main() {
 
 	fmt.Printf("Downloading and extracting: %s\n", url)
 	fmt.Printf("Output directory: %s\n", outputDir)
-	fmt.Printf("Pipeline: HTTP Download → Decompress → Extract (all parallel)\n\n")
+	if streamBuffer != nil {
+		fmt.Printf("Pipeline: HTTP Download → Decompress → [Buffer in Memory] + [Extract Files] (all parallel)\n\n")
+	} else {
+		fmt.Printf("Pipeline: HTTP Download → Decompress → Extract (all parallel)\n\n")
+	}
 
 	ctx := context.Background()
 	stats, err := extractor.ExtractFromURL(ctx, url, callback)
@@ -159,8 +270,35 @@ func main() {
 	fmt.Printf("  Bytes: %d (%.2f GB)\n", stats.TotalBytes, float64(stats.TotalBytes)/1024/1024/1024)
 	fmt.Printf("  Duration: %v\n", stats.Duration)
 	fmt.Printf("  Throughput: %.2f MB/s\n", float64(stats.TotalBytes)/1024/1024/stats.Duration.Seconds())
+
+	// show stream buffer stats if enabled
+	if streamBuffer != nil {
+		bufferedMB := float64(streamBuffer.GetTotalBytes()) / 1024 / 1024
+		fmt.Printf("\n✓ Decompressed stream buffering:\n")
+		fmt.Printf("  Chunks: %d\n", streamBuffer.GetChunkCount())
+		fmt.Printf("  Bytes buffered: %d (%.2f MB)\n", streamBuffer.GetTotalBytes(), bufferedMB)
+
+		// optionally save to disk
+		tarPath := filepath.Join(outputDir, "decompressed.tar")
+		fmt.Printf("\nSaving decompressed tar to: %s\n", tarPath)
+		if err := streamBuffer.SaveToFile(tarPath); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to save decompressed tar: %v\n", err)
+		} else {
+			fmt.Printf("✓ Decompressed tar saved successfully\n")
+			fmt.Printf("\nYou can now:\n")
+			fmt.Printf("  • Re-extract without downloading: tar -xf %s\n", tarPath)
+			fmt.Printf("  • Compress with different format: zstd %s\n", tarPath)
+			fmt.Printf("  • Verify integrity: sha256sum %s\n", tarPath)
+		}
+	}
+
 	fmt.Printf("\nPipeline worked in parallel:\n")
 	fmt.Printf("  • HTTP download (goroutine 1)\n")
 	fmt.Printf("  • Decompression (goroutine 2)\n")
-	fmt.Printf("  • Tar extraction (main goroutine)\n")
+	if streamBuffer != nil {
+		fmt.Printf("  • Stream buffering (goroutine 3) - async, non-blocking\n")
+		fmt.Printf("  • Tar extraction (main goroutine)\n")
+	} else {
+		fmt.Printf("  • Tar extraction (main goroutine)\n")
+	}
 }

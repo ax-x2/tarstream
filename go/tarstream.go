@@ -14,6 +14,7 @@ import (
 // types from pipeline for public API
 type (
 	FileCallback      = pipeline.FileCallback
+	StreamCallback    = pipeline.StreamCallback // callback for decompressed chunks (async, non-blocking)
 	FileMetadata      = pipeline.FileMetadata
 	CallbackAction    = pipeline.CallbackAction
 	ExtractionStats   = pipeline.ExtractionStats
@@ -56,6 +57,7 @@ type TarStreamExtractor struct {
 	compression     CompressionType
 	bufferSize      int
 	channelCapacity int
+	streamCallback  StreamCallback // optional callback for decompressed chunks
 	maxFileSize     *uint64
 	httpClient      *http.Client
 }
@@ -98,6 +100,20 @@ func (e *TarStreamExtractor) WithBufferSize(size int) *TarStreamExtractor {
 //   - example: 12 * 128KB * 2 = 3MB
 func (e *TarStreamExtractor) WithChannelCapacity(capacity int) *TarStreamExtractor {
 	e.channelCapacity = capacity
+	return e
+}
+
+// WithStreamCallback sets optional callback for decompressed chunks.
+// callback runs asynchronously in dedicated goroutine - does NOT block pipeline.
+//
+// use cases:
+//   - hash/checksum the decompressed tar stream
+//   - save raw decompressed tar to disk
+//   - implement custom processing on decompressed chunks
+//
+// chunks are COPIED before callback - safe to retain. callback receives 256KB chunks.
+func (e *TarStreamExtractor) WithStreamCallback(callback StreamCallback) *TarStreamExtractor {
+	e.streamCallback = callback
 	return e
 }
 
@@ -161,6 +177,9 @@ func (e *TarStreamExtractor) ExtractFromURL(
 
 	// execute pipeline
 	p := pipeline.NewPipeline(bufSize, e.channelCapacity)
+	if e.streamCallback != nil {
+		p.SetStreamCallback(e.streamCallback)
+	}
 	stats, err := p.Execute(ctx, resp.Body, compression.CompressionType(comp), callback, e.maxFileSize)
 	if err != nil {
 		return stats, err
@@ -194,6 +213,9 @@ func (e *TarStreamExtractor) ExtractFromReader(
 	}
 
 	p := pipeline.NewPipeline(bufSize, e.channelCapacity)
+	if e.streamCallback != nil {
+		p.SetStreamCallback(e.streamCallback)
+	}
 	stats, err := p.Execute(ctx, reader, compression.CompressionType(comp), callback, e.maxFileSize)
 	if err != nil {
 		return stats, err

@@ -20,6 +20,24 @@ const (
 	ActionStop
 )
 
+// StreamCallback processes raw decompressed data before tar parsing.
+// runs in dedicated goroutine - does NOT block decompression pipeline.
+//
+// use cases:
+//   - hash/checksum the decompressed tar stream
+//   - save raw decompressed tar to disk
+//   - implement custom processing on decompressed chunks
+//
+// - chunks are COPIED (not borrowed) - safe to retain
+// - runs asynchronously in separate goroutine
+// - if callback is slow, only affects callback processing, not main pipeline
+type StreamCallback interface {
+	// OnDecompressedChunk is called for each decompressed chunk (e.g., 256KB)
+	// chunk is a COPY - safe to retain or process slowly
+	// called asynchronously - does not block decompression
+	OnDecompressedChunk(chunk []byte) error
+}
+
 // FileCallback processes tar entries during streaming extraction.
 //
 // - OnFileChunk receives a borrowed slice from the buffer pool

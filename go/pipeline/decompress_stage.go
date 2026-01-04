@@ -16,6 +16,9 @@ import (
 // a single compressed chunk (e.g. 128KB) can decompress into multiple batches (e.g. 10MB).
 // if we dont drain completely before next Write(), decompressor state gets corrupted -> hang/corruption.
 // this is especially critical for high-compression-ratio data (10:1 or higher).
+//
+// callbackCh: optional channel for streaming decompressed chunks to async callback.
+// if provided, chunks are COPIED and sent non-blocking (does not block decompression).
 func DecompressStage(
 	ctx context.Context,
 	compType compression.CompressionType,
@@ -23,6 +26,7 @@ func DecompressStage(
 	out chan<- []byte,
 	errCh chan<- error,
 	cache *bufferCache,
+	callbackCh chan<- []byte, // optional: nil = no callback
 ) {
 	decompressor, err := compression.NewDecompressor(compType)
 	if err != nil {
@@ -97,9 +101,27 @@ func DecompressStage(
 				// send filled buffers downstream, return unused buffers
 				for i, size := range sizes {
 					if size > 0 {
+						// send to tar stage (blocking)
 						select {
 						case out <- outputBatch[i][:size]:
-							// sent to next stage
+							// sent to tar stage
+
+							// optional: send copy to stream callback (non-blocking)
+							if callbackCh != nil {
+								// make a copy since callback runs async and may retain it
+								chunkCopy := make([]byte, size)
+								copy(chunkCopy, outputBatch[i][:size])
+
+								// non-blocking send to avoid blocking decompression
+								select {
+								case callbackCh <- chunkCopy:
+									// sent to callback goroutine
+								default:
+									// callback channel full, skip this chunk to avoid blocking
+									// user can increase channel capacity if needed
+								}
+							}
+
 						case <-ctx.Done():
 							// cleanup: return current buffer and all remaining
 							cache.Put(outputBatch[i])
