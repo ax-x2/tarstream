@@ -60,6 +60,7 @@ type TarStreamExtractor struct {
 	streamCallback  StreamCallback // optional callback for decompressed chunks
 	maxFileSize     *uint64
 	httpClient      *http.Client
+	workerCount     int // 0 = sequential, >0 = parallel workers
 }
 
 // New creates an extractor with defaults:
@@ -131,6 +132,23 @@ func (e *TarStreamExtractor) WithHTTPClient(client *http.Client) *TarStreamExtra
 	return e
 }
 
+// WithWorkerCount enables parallel file processing with N workers.
+// default: 0 (sequential processing in main goroutine)
+// recommended: 60 for high-throughput I/O-bound workloads (e.g., NVMe disk writes)
+//
+// memory usage: ~workerCount × 10 chunks × bufferSize
+// example: 60 workers × 10 chunks × 2MB = 1.2GB
+//
+// notes:
+//   - tar parsing remains sequential (archive/tar is not thread-safe)
+//   - workers process files in parallel (OnFileStart/OnFileChunk/OnFileEnd)
+//   - files complete out-of-order (workers finish at different rates)
+//   - memory bounded: max N files in-flight (N = workerCount)
+func (e *TarStreamExtractor) WithWorkerCount(count int) *TarStreamExtractor {
+	e.workerCount = count
+	return e
+}
+
 // ExtractFromURL downloads and extracts tar archive from URL.
 // supports HTTP/HTTPS with streaming - constant memory usage regardless of archive size.
 //
@@ -180,6 +198,9 @@ func (e *TarStreamExtractor) ExtractFromURL(
 	if e.streamCallback != nil {
 		p.SetStreamCallback(e.streamCallback)
 	}
+	if e.workerCount > 0 {
+		p.WithWorkerCount(e.workerCount)
+	}
 	stats, err := p.Execute(ctx, resp.Body, compression.CompressionType(comp), callback, e.maxFileSize)
 	if err != nil {
 		return stats, err
@@ -215,6 +236,9 @@ func (e *TarStreamExtractor) ExtractFromReader(
 	p := pipeline.NewPipeline(bufSize, e.channelCapacity)
 	if e.streamCallback != nil {
 		p.SetStreamCallback(e.streamCallback)
+	}
+	if e.workerCount > 0 {
+		p.WithWorkerCount(e.workerCount)
 	}
 	stats, err := p.Execute(ctx, reader, compression.CompressionType(comp), callback, e.maxFileSize)
 	if err != nil {

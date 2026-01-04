@@ -13,6 +13,7 @@ import (
 //
 // - 3+ concurrent goroutines with buffered channels (configurable capacity)
 // - optional 4th goroutine for stream callbacks (async, non-blocking)
+// - optional worker pool for parallel tar entry processing
 // - context-based cancellation propagates through all stages
 // - error channel aggregates errors from all stages
 // - WaitGroup ensures clean shutdown
@@ -21,6 +22,7 @@ type Pipeline struct {
 	bufferSize      int
 	channelCapacity int            // channel buffer capacity (0 = use default: 12)
 	streamCallback  StreamCallback // optional callback for decompressed chunks
+	workerCount     int            // 0 = sequential tar processing, >0 = parallel workers
 }
 
 // NewPipeline creates a new pipeline with specified buffer size and channel capacity.
@@ -38,6 +40,15 @@ func NewPipeline(bufferSize, channelCapacity int) *Pipeline {
 // callback runs asynchronously in dedicated goroutine (does not block pipeline).
 func (p *Pipeline) SetStreamCallback(callback StreamCallback) {
 	p.streamCallback = callback
+}
+
+// WithWorkerCount enables parallel tar entry processing with N workers.
+// default: 0 (sequential processing in main goroutine)
+// recommended: 60 for high-throughput I/O-bound workloads
+// memory usage: ~workerCount × 10 chunks × bufferSize
+func (p *Pipeline) WithWorkerCount(count int) *Pipeline {
+	p.workerCount = count
+	return p
 }
 
 // execute runs the pipeline: reader -> decompress -> tar -> callback
@@ -116,9 +127,29 @@ func (p *Pipeline) Execute(
 		DecompressStage(ctx, compression, rawCh, decompCh, errCh, cacheDecomp, callbackCh)
 	}()
 
+	// create worker pool if parallel mode enabled
+	var workerPool *WorkerPool
+	if p.workerCount > 0 {
+		workerPool = NewWorkerPool(p.workerCount, callback, p.bufferPool)
+		workerPool.Start()
+	}
+
 	// tar parsing stage (runs in this goroutine)
-	// running in main goroutine simplifies callback execution (no goroutine leaks from callbacks)
-	stats, tarErr := TarStage(ctx, decompCh, callback, maxFileSize, cacheTar)
+	// sequential mode: runs in main goroutine (no goroutine leaks from callbacks)
+	// parallel mode: dispatches to worker pool
+	var stats *ExtractionStats
+	var tarErr error
+
+	if workerPool != nil {
+		stats, tarErr = TarStageParallel(ctx, decompCh, callback, maxFileSize, cacheTar, workerPool)
+
+		// shutdown worker pool and collect errors
+		if shutdownErr := workerPool.Shutdown(); shutdownErr != nil && tarErr == nil {
+			tarErr = shutdownErr
+		}
+	} else {
+		stats, tarErr = TarStage(ctx, decompCh, callback, maxFileSize, cacheTar)
+	}
 
 	// wait for upstream stages to complete
 	wg.Wait()
